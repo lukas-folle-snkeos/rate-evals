@@ -249,10 +249,10 @@ class ExtractConfig:
     data_dir: Optional[Path] = None
     """Path to the data directory containing train.json, manifest.csv, and volumes/ subdirectory."""
 
-    patientlist_path: Optional[Path] = Path("/mnt/c/Users/ilyas.sirazitdinov/Downloads/similarityPatientList_flat.json")
+    patientlist_path: Optional[Path] = Path("/mnt/x/ML/FOUNDATION/PatientSimilarity/similarityPatientList_flat.json")
     """Path to the patient list JSON file for DICOM Web access."""
 
-    nifti_files: Optional[List[Path]] = field(default_factory=lambda: [Path("/mnt/c/Users/ilyas.sirazitdinov/Downloads/_2.nii.gz")])
+    nifti_files: Optional[List[Path]] = field(default_factory=lambda: [Path("custom_path_to_nifti_file.nii.gz")])
     """Path to a NIfTI file (.nii.gz) to process directly. If provided, data_dir is auto-generated."""
 
     anatomy: Literal["chest", "abdomen", "brain"] = "chest"
