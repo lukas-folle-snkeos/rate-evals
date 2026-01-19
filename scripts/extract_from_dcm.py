@@ -198,16 +198,16 @@ def get_image_cached(cfg_json: str, pat_list_record_json: str, slice_set_record_
 
 def patient_list_to_nifti_files_generator(patientlist_path: Path):
     """Generator that yields NIfTI files for each patient and slice_set.
-    
+
     Parameters
     ----------
     patientlist_path : Path
         Path to the patient list JSON file.
-    
+
     Yields
     ------
-    Path
-        Path to the generated NIfTI file.
+    tuple[Path, Path, Path]
+        (nifti_file_path, dcm_folder, nifti_output_folder)
     """
     for patient in json.load(open(patientlist_path))["Patients"]:
         for slice_set in patient["SliceSets"]:
@@ -239,7 +239,7 @@ def patient_list_to_nifti_files_generator(patientlist_path: Path):
             if not nifti_files:
                 raise FileNotFoundError(f"No .nii.gz files found in {nifti_output_folder}")
 
-            yield nifti_files[0]
+            yield nifti_files[0], dcm_folder, nifti_output_folder
 
 
 @dataclass
@@ -411,13 +411,13 @@ def main(config: ExtractConfig) -> None:
     if config.patientlist_path is not None:
         nifty_files = patient_list_to_nifti_files_generator(config.patientlist_path)
     elif config.nifti_files is not None:
-        nifty_files = config.nifti_files
+        nifty_files = [(f, None, None) for f in config.nifti_files]
     else:
         raise ValueError("Either patientlist_path or nifti_files must be provided.")
-    for nifti_file in nifty_files:
-        run_extraction_for_nifti(nifti_file, config, temp_dir_created)
+    for nifti_file, dcm_folder, nifti_output_folder in nifty_files:
+        run_extraction_for_nifti(nifti_file, config, temp_dir_created, dcm_folder, nifti_output_folder)
 
-def run_extraction_for_nifti(nifti_file: Path, config: ExtractConfig, temp_dir_created: Optional[Path]) -> None:
+def run_extraction_for_nifti(nifti_file: Path, config: ExtractConfig, temp_dir_created: Optional[Path], dcm_folder: Optional[Path] = None, nifti_output_folder: Optional[Path] = None) -> None:
     try:
 
         nifti_file = nifti_file.resolve()
@@ -594,6 +594,15 @@ def run_extraction_for_nifti(nifti_file: Path, config: ExtractConfig, temp_dir_c
         if temp_dir_created is not None:
             print(f"\nCleaning up temporary directory: {temp_dir_created}")
             shutil.rmtree(temp_dir_created, ignore_errors=True)
+
+        # Cleanup DICOM and NIfTI conversion temporary folders
+        if dcm_folder is not None:
+            print(f"Cleaning up DICOM folder: {dcm_folder}")
+            shutil.rmtree(dcm_folder, ignore_errors=True)
+
+        if nifti_output_folder is not None:
+            print(f"Cleaning up NIfTI output folder: {nifti_output_folder}")
+            shutil.rmtree(nifti_output_folder, ignore_errors=True)
 
 
 if __name__ == "__main__":
