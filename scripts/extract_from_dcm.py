@@ -33,16 +33,213 @@ Examples:
         --cache-manifest /data/scans/manifest.csv
 """
 
+from functools import lru_cache
 import json
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 import numpy as np
 import tyro
+
+import urllib.request
+
+from pydicom import dcmread
+from omegaconf import OmegaConf
+import concurrent.futures
+
+@dataclass
+class DicomWADOURI:
+    """Class with the information to create a DICOM via WADO URI."""
+
+    patient_uid: str
+    study_uid: str
+    series_uid: str
+    object_uid: str
+    local_proxy: str = "http://localhost:55581/dicomproxy"
+    wado_request: str = "wado?requestType=WADO"
+    content_type: str = "contentType=application/dicom"
+
+    def create_uri(self) -> str:
+        """Create WADO URI.
+
+        Returns
+        -------
+        str
+            DICOM Web URI.
+        """
+        local_proxy_request = f"{self.local_proxy}/{self.wado_request}"
+        uri = ("&").join(
+            [
+                local_proxy_request,
+                # f"patientUID={self.patient_uid}", # some pat ids have spaces, that leads to an error
+                f"studyUID={self.study_uid}",
+                f"seriesUID={self.series_uid}",
+                f"objectUID={self.object_uid}",
+                self.content_type,
+            ]
+        )
+        return uri
+
+def get_dcm_from_dicom_web(
+    patient_uid: str,
+    study_uid: str,
+    series_uid: str,
+    object_uid: str,
+    local_proxy: str,
+    wado_request: str,
+    content_type: str,
+):
+    """Get DICOM from DICOM Web.
+
+    Parameters
+    ----------
+    patient_uid : str
+        patient_uid
+    study_uid : str
+        study_uid
+    series_uid : str
+        series_uid
+    object_uid : str
+        object_uid, instance SOP uid
+    local_proxy : str
+        dicom proxy address
+    wado_request : str
+        wado request prefix
+    content_type : str
+        content type of request
+
+    Returns
+    -------
+    FileDataset
+        DICOM
+    """
+    content_dcm_url = DicomWADOURI(
+        patient_uid=patient_uid,
+        study_uid=study_uid,
+        series_uid=series_uid,
+        object_uid=object_uid,
+        local_proxy=local_proxy,
+        wado_request=wado_request,
+        content_type=content_type,
+    ).create_uri()
+    if content_dcm_url.lower().startswith("http"):
+        temp_cont_dcm_name, _ = urllib.request.urlretrieve(content_dcm_url)  # noqa: S310
+    else:
+        raise ValueError("content_dcm_url must be a http request")
+    return temp_cont_dcm_name
+
+IPP_PRIVATE_DCM_TAG = (0x0027, 0x1020)
+SIZE_PRIVATE_DCM_TAG = (0x0027, 0x1010)
+@lru_cache(maxsize=2)
+def get_image_cached(cfg_json: str, pat_list_record_json: str, slice_set_record_json: str):
+    """Get image from DICOM Proxy.
+
+    Parameters
+    ----------
+    cfg : DictConfig
+        Evaluation config.
+    pat_list_record : DictConfig
+        Patient list record.
+
+    Returns
+    -------
+
+    """
+    cfg = OmegaConf.create(json.loads(cfg_json))
+    pat_list_record = OmegaConf.create(json.loads(pat_list_record_json))
+    patient_uid = pat_list_record.dcmPatientID
+    slice_set = OmegaConf.create(json.loads(slice_set_record_json))
+    # slice_set = pat_list_record.SliceSets[0]
+    study_uid = slice_set.UID.dcmStudyInstanceUID
+
+    container_dcm = dcmread(get_dcm_from_dicom_web(
+        patient_uid=patient_uid,
+        study_uid=study_uid,
+        series_uid=slice_set.UID.dcmSeriesInstanceUID,
+        object_uid=slice_set.UID.dcmSOPInstanceUID,
+        local_proxy=cfg.dicom_web_connection.local_proxy,
+        wado_request=cfg.dicom_web_connection.wado_request,
+        content_type=cfg.dicom_web_connection.content_type,
+    ))
+
+    # Extract series_uid once (assumed constant for all slices)
+    series_uid = container_dcm[(0x0040, 0xA375)][0][(0x0008, 0x1115)][0].SeriesInstanceUID
+
+    # Helper function to fetch a DICOM image using the web call.
+    def fetch_dcm(c_seq):
+        return get_dcm_from_dicom_web(
+            patient_uid=patient_uid,
+            study_uid=study_uid,
+            series_uid=series_uid,
+            object_uid=c_seq[(0x0008, 0x1199)][0].ReferencedSOPInstanceUID,
+            local_proxy=cfg.dicom_web_connection.local_proxy,
+            wado_request=cfg.dicom_web_connection.wado_request,
+            content_type=cfg.dicom_web_connection.content_type,
+        )
+
+    # Use ThreadPoolExecutor to fetch DICOM images concurrently.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        dcm_results = list(executor.map(fetch_dcm, container_dcm.ContentSequence))
+
+    # Move dcm results to separate temp folder
+    dcm_folder = Path(tempfile.mkdtemp(prefix="dcm_files_"))
+    new_dcm_paths = []
+    for idx, temp_path in enumerate(dcm_results):
+        new_path = dcm_folder / f"slice_{idx:04d}.dcm"
+        shutil.move(temp_path, new_path)
+        new_dcm_paths.append(new_path)
+
+    dcm_results = new_dcm_paths
+    return dcm_folder
+
+def patient_list_to_nifti_files_generator(patientlist_path: Path):
+    """Generator that yields NIfTI files for each patient and slice_set.
+    
+    Parameters
+    ----------
+    patientlist_path : Path
+        Path to the patient list JSON file.
+    
+    Yields
+    ------
+    Path
+        Path to the generated NIfTI file.
+    """
+    for patient in json.load(open(patientlist_path))["Patients"]:
+        for slice_set in patient["SliceSets"]:
+            dcm_folder = get_image_cached(
+                json.dumps(
+                    {
+                        "dicom_web_connection": {
+                            "local_proxy": "http://localhost:55581/dicomproxy",
+                            "wado_request": "wado?requestType=WADO",
+                            "content_type": "contentType=application/dicom",
+                        }
+                    }
+                ),
+                json.dumps(patient),
+                json.dumps(slice_set)
+            )
+            print(f"DICOM folder for patient {patient['dcmPatientID']}: {dcm_folder}")
+
+            # Convert DICOM folder to NIfTI
+            nifti_output_folder = Path(tempfile.mkdtemp(prefix="nifti_output_"))
+            import subprocess
+            # Use slice_set hash as prefix for the output files
+            hash_prefix = slice_set.get("hash", "nifti")
+            cmd = ["dcm2niix", "-z", "y", "-f", f"{hash_prefix}_%p_%s", "-o", str(nifti_output_folder), str(dcm_folder)]
+            subprocess.run(cmd, check=True)
+
+            # Find the generated NIfTI file (can be any series number)
+            nifti_files = list(nifti_output_folder.glob("*.nii.gz"))
+            if not nifti_files:
+                raise FileNotFoundError(f"No .nii.gz files found in {nifti_output_folder}")
+
+            yield nifti_files[0]
 
 
 @dataclass
@@ -52,7 +249,10 @@ class ExtractConfig:
     data_dir: Optional[Path] = None
     """Path to the data directory containing train.json, manifest.csv, and volumes/ subdirectory."""
 
-    nifti_file: Optional[Path] = None
+    patientlist_path: Optional[Path] = Path("/mnt/c/Users/ilyas.sirazitdinov/Downloads/similarityPatientList_flat.json")
+    """Path to the patient list JSON file for DICOM Web access."""
+
+    nifti_files: Optional[List[Path]] = field(default_factory=lambda: [Path("/mnt/c/Users/ilyas.sirazitdinov/Downloads/_2.nii.gz")])
     """Path to a NIfTI file (.nii.gz) to process directly. If provided, data_dir is auto-generated."""
 
     anatomy: Literal["chest", "abdomen", "brain"] = "chest"
@@ -118,20 +318,25 @@ def setup_nifti_data_structure(
     # Load NIfTI file and convert to numpy array
     print(f"Loading NIfTI file: {nifti_file}")
     nifti_img = nib.load(str(nifti_file))
+    
+    # Reorder to canonical orientation for consistent axis alignment
+    # This converts to RAS+ (Right-Anterior-Superior)
+    nifti_img = nib.as_closest_canonical(nifti_img)
     volume_data = nifti_img.get_fdata()
-
-    print(f"NIfTI shape: {volume_data.shape}, dtype: {volume_data.dtype}")
-
-    # Convert to numpy array and save as .npy
-    # RVE expects numpy format
-    volume_npy = volumes_dir / "volume.npy"
-    np.save(volume_npy, volume_data.astype(np.float32))
-    print(f"Converted and saved volume to: {volume_npy}")
-
+    
+    # In RAS+ canonical: axis0=R(right), axis1=A(anterior), axis2=S(superior)
+    # User wants: axis0=S(top-bottom), axis1=R(left-right), axis2=A(inf-ant)
+    # Transpose from (R,A,S) to (S,R,A)
+    volume_data = volume_data.transpose(2, 0, 1)
+    np.save(volumes_dir / "volume.npy", volume_data)
+    print(f"Saved volume data to: {volumes_dir / 'volume.npy'}")
+    print(f"Volume shape (S,R,A): {volume_data.shape}")
+    np.save("temp.npy", volume_data)
     # Get spacing information if available
     try:
         spacing = nifti_img.header.get_zooms()
-        original_spacing = [float(s) for s in spacing[:3]]
+        spacing_list = [float(s) for s in spacing[:3]]
+        original_spacing = [spacing_list[i] for i in [2, 0, 1]]
     except Exception:
         original_spacing = [1.0, 1.0, 1.0]
 
@@ -187,14 +392,14 @@ def main(config: ExtractConfig) -> None:
     """Extract embeddings from DICOM folders using Pillar0 models."""
 
     # Validate input: either data_dir or nifti_file must be provided
-    if config.data_dir is None and config.nifti_file is None:
+    if config.data_dir is None and config.nifti_files is None:
         print(
             "Error: Either --config.data-dir or --config.nifti-file must be provided",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    if config.data_dir is not None and config.nifti_file is not None:
+    if config.data_dir is not None and config.nifti_files is not None:
         print(
             "Error: Cannot specify both --config.data-dir and --config.nifti-file", file=sys.stderr
         )
@@ -203,32 +408,30 @@ def main(config: ExtractConfig) -> None:
     # Track if we created a temporary directory for cleanup
     temp_dir_created = None
 
+    if config.patientlist_path is not None:
+        nifty_files = patient_list_to_nifti_files_generator(config.patientlist_path)
+    elif config.nifti_files is not None:
+        nifty_files = config.nifti_files
+    else:
+        raise ValueError("Either patientlist_path or nifti_files must be provided.")
+    for nifti_file in nifty_files:
+        run_extraction_for_nifti(nifti_file, config, temp_dir_created)
+
+def run_extraction_for_nifti(nifti_file: Path, config: ExtractConfig, temp_dir_created: Optional[Path]) -> None:
     try:
-        # If nifti_file is provided, create temporary data structure
-        if config.nifti_file is not None:
-            nifti_file = config.nifti_file.resolve()
-            print(f"NIfTI file mode: {nifti_file}")
 
-            # Map anatomy for consistency
-            anatomy = config.anatomy
-            if anatomy in ["abdomen", "abd"]:
-                anatomy = "abdomen"
+        nifti_file = nifti_file.resolve()
+        print(f"NIfTI file mode: {nifti_file}")
 
-            # Create temporary data structure
-            data_dir = setup_nifti_data_structure(nifti_file, anatomy, config.sample_name)
-            temp_dir_created = data_dir
-        else:
-            # Validate data directory
-            data_dir = config.data_dir
-            if not data_dir.exists():
-                print(f"Error: Data directory does not exist: {data_dir}", file=sys.stderr)
-                sys.exit(1)
-            if not data_dir.is_dir():
-                print(f"Error: {data_dir} is not a directory", file=sys.stderr)
-                sys.exit(1)
+        # Map anatomy for consistency
+        anatomy = config.anatomy
+        if anatomy in ["abdomen", "abd"]:
+            anatomy = "abdomen"
 
-            # Get absolute path
-            data_dir = data_dir.resolve()
+        # Create temporary data structure
+        data_dir = setup_nifti_data_structure(nifti_file, anatomy, config.sample_name)
+        temp_dir_created = data_dir
+
 
         # Map anatomy to dataset and model repo
         anatomy = config.anatomy
@@ -324,8 +527,8 @@ def main(config: ExtractConfig) -> None:
         print("Pillar0 Embedding Extraction")
         print("=" * 60)
         print(f"Data Directory:  {data_dir}")
-        if config.nifti_file:
-            print(f"NIfTI File:      {config.nifti_file}")
+        if config.nifti_files:
+            print(f"NIfTI File:      {config.nifti_files}")
         print(f"Anatomy Type:    {anatomy}")
         print(f"Dataset:         {dataset}")
         print(f"Model Repo:      {model_repo_id}")
