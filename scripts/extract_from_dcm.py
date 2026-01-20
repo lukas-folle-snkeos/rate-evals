@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import List, Literal, Optional
 
 import numpy as np
+from tqdm import tqdm
 import tyro
 
 import urllib.request
@@ -209,7 +210,7 @@ def patient_list_to_nifti_files_generator(patientlist_path: Path):
     tuple[Path, Path, Path, Path | None]
         (nifti_file_path, dcm_folder, nifti_output_folder, decompressed_dcm_folder)
     """
-    for patient in json.load(open(patientlist_path))["Patients"]:
+    for patient in tqdm(json.load(open(patientlist_path))["Patients"]):
         for slice_set in patient["SliceSets"]:
             dcm_folder = get_image_cached(
                 json.dumps(
