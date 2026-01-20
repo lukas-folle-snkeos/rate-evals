@@ -206,8 +206,8 @@ def patient_list_to_nifti_files_generator(patientlist_path: Path):
 
     Yields
     ------
-    tuple[Path, Path, Path]
-        (nifti_file_path, dcm_folder, nifti_output_folder)
+    tuple[Path, Path, Path, Path | None]
+        (nifti_file_path, dcm_folder, nifti_output_folder, decompressed_dcm_folder)
     """
     for patient in json.load(open(patientlist_path))["Patients"]:
         for slice_set in patient["SliceSets"]:
@@ -226,12 +226,41 @@ def patient_list_to_nifti_files_generator(patientlist_path: Path):
             )
             print(f"DICOM folder for patient {patient['dcmPatientID']}: {dcm_folder}")
 
-            # Convert DICOM folder to NIfTI
+            # If JPEG-compressed DICOMs cause issues, decompress with dcmdjpeg first
+            decompressed_folder: Path | None = None
+            try:
+                import subprocess
+                from shutil import which
+                if which("dcmdjpeg") is not None:
+                    decompressed_folder = Path(tempfile.mkdtemp(prefix="dcm_decompressed_"))
+                    for src in dcm_folder.glob("*.dcm"):
+                        dst = decompressed_folder / src.name
+                        result = subprocess.run(["dcmdjpeg", str(src), str(dst)], capture_output=True, text=True)
+                        if result.returncode != 0:
+                            print(f"Warning: dcmdjpeg failed for {src.name}: {result.stderr.strip()}")
+                            # Fallback: copy original file
+                            shutil.copy2(src, dst)
+                else:
+                    print("dcmdjpeg not found. Install DCMTK to decompress JPEG-compressed DICOMs.")
+            except Exception as e:
+                print(f"Warning: decompression step encountered an error: {e}")
+                decompressed_folder = None
+
+            # Convert DICOM folder to NIfTI using the (possibly) decompressed folder
             nifti_output_folder = Path(tempfile.mkdtemp(prefix="nifti_output_"))
-            import subprocess
             # Use slice_set hash as prefix for the output files
             hash_prefix = slice_set.get("hash", "nifti")
-            cmd = ["dcm2niix", "-z", "y", "-f", f"{hash_prefix}_%p_%s", "-o", str(nifti_output_folder), str(dcm_folder)]
+            input_folder = decompressed_folder if decompressed_folder is not None else dcm_folder
+            cmd = [
+                "dcm2niix",
+                "-z",
+                "y",
+                "-f",
+                f"{hash_prefix}_%p_%s",
+                "-o",
+                str(nifti_output_folder),
+                str(input_folder),
+            ]
             subprocess.run(cmd, check=True)
 
             # Find the generated NIfTI file (can be any series number)
@@ -239,7 +268,7 @@ def patient_list_to_nifti_files_generator(patientlist_path: Path):
             if not nifti_files:
                 raise FileNotFoundError(f"No .nii.gz files found in {nifti_output_folder}")
 
-            yield nifti_files[0], dcm_folder, nifti_output_folder
+            yield nifti_files[0], dcm_folder, nifti_output_folder, decompressed_folder
 
 
 @dataclass
@@ -411,13 +440,27 @@ def main(config: ExtractConfig) -> None:
     if config.patientlist_path is not None:
         nifty_files = patient_list_to_nifti_files_generator(config.patientlist_path)
     elif config.nifti_files is not None:
-        nifty_files = [(f, None, None) for f in config.nifti_files]
+        nifty_files = [(f, None, None, None) for f in config.nifti_files]
     else:
         raise ValueError("Either patientlist_path or nifti_files must be provided.")
-    for nifti_file, dcm_folder, nifti_output_folder in nifty_files:
-        run_extraction_for_nifti(nifti_file, config, temp_dir_created, dcm_folder, nifti_output_folder)
+    for nifti_file, dcm_folder, nifti_output_folder, decompressed_dcm_folder in nifty_files:
+        run_extraction_for_nifti(
+            nifti_file,
+            config,
+            temp_dir_created,
+            dcm_folder,
+            nifti_output_folder,
+            decompressed_dcm_folder,
+        )
 
-def run_extraction_for_nifti(nifti_file: Path, config: ExtractConfig, temp_dir_created: Optional[Path], dcm_folder: Optional[Path] = None, nifti_output_folder: Optional[Path] = None) -> None:
+def run_extraction_for_nifti(
+    nifti_file: Path,
+    config: ExtractConfig,
+    temp_dir_created: Optional[Path],
+    dcm_folder: Optional[Path] = None,
+    nifti_output_folder: Optional[Path] = None,
+    decompressed_dcm_folder: Optional[Path] = None,
+) -> None:
     try:
 
         nifti_file = nifti_file.resolve()
@@ -599,6 +642,10 @@ def run_extraction_for_nifti(nifti_file: Path, config: ExtractConfig, temp_dir_c
         if dcm_folder is not None:
             print(f"Cleaning up DICOM folder: {dcm_folder}")
             shutil.rmtree(dcm_folder, ignore_errors=True)
+
+        if decompressed_dcm_folder is not None:
+            print(f"Cleaning up decompressed DICOM folder: {decompressed_dcm_folder}")
+            shutil.rmtree(decompressed_dcm_folder, ignore_errors=True)
 
         if nifti_output_folder is not None:
             print(f"Cleaning up NIfTI output folder: {nifti_output_folder}")
